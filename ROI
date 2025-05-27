@@ -1,0 +1,53 @@
+import os
+import nibabel as nib
+import numpy as np
+import json
+import pandas as pd
+
+
+rna_csv_path = 'C:/Users/95602/Desktop/ultrasound-contrastivemodels-klr-us-rna/TCIA/TCIA/combined_summary_filtered.csv'
+rna_df = pd.read_csv(rna_csv_path, index_col=0)
+sample_ids = list(rna_df.columns)
+
+
+root_folder = 'C:/Users/95602/Desktop/ultrasound-contrastivemodels-klr-us-rna/TCIA/TCIA'
+
+
+seg_file_dict = {}
+for dirpath, dirnames, filenames in os.walk(root_folder):
+    for filename in filenames:
+        if filename.startswith('seg') and filename.endswith('.nii.gz'):
+            seg_file_dict[filename] = os.path.join(dirpath, filename)
+
+
+def get_bbox_from_mask(mask_path):
+    mask_img = nib.load(mask_path)
+    mask_data = mask_img.get_fdata()
+    coords = np.argwhere(mask_data > 0)
+    if coords.size == 0:
+        raise ValueError(f"No segmented region found in {mask_path}")
+    x_min, y_min, z_min = coords.min(axis=0)
+    x_max, y_max, z_max = coords.max(axis=0)
+    return {
+        "x_min": int(x_min), "x_max": int(x_max + 1),
+        "y_min": int(y_min), "y_max": int(y_max + 1),
+        "z_min": int(z_min), "z_max": int(z_max + 1)
+    }
+
+bbox_coords = {}
+for sample_id in sample_ids:
+    seg_filename = f"seg{sample_id.replace('-', '')}.nii.gz"
+    seg_path = seg_file_dict.get(seg_filename, None)
+    if seg_path is not None:
+        try:
+            bbox = get_bbox_from_mask(seg_path)
+            bbox_coords[seg_filename] = bbox
+        except Exception as e:
+            print(f"Error for {sample_id}: {e}")
+    else:
+        print(f"[WARN] No seg file found for {sample_id}")
+
+with open('bbox_coords.json', 'w') as f:
+    json.dump(bbox_coords, f, indent=2)
+
+print('Bounding Box sav as bbox_coords.json ')
