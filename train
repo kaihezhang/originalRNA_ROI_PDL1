@@ -1,0 +1,167 @@
+import os
+import re
+import json
+import torch
+import pandas as pd
+import numpy as np
+import nibabel as nib
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+from model import RNAEncoder, ResNetMultiChannel, CLIPModel, ContrastiveLoss
+
+rna_path        = r'C:\Users\95602\Desktop\ultrasound-contrastivemodels-klr-us-rna\TCIA\TCIA\combined_summary_filtered.csv'
+image_directory = r'C:\Users\95602\Desktop\ultrasound-contrastivemodels-klr-us-rna\TCIA\TCIA'
+bbox_json_path  = r'C:\Users\95602\PycharmProjects\PythonProject2\bbox_coords.json'
+N_CHANNELS = 16
+IMG_SIZE = 224
+
+
+rna_df = pd.read_csv(rna_path, index_col=0)
+rna_df = rna_df.fillna(0).T
+rna_df.index = rna_df.index.str.strip()
+
+
+with open(bbox_json_path, 'r') as f:
+    bbox_coords = json.load(f)
+
+
+nifti_files = []
+for root, _, files in os.walk(image_directory):
+    for fname in files:
+        if fname.lower().endswith('.nii') or fname.lower().endswith('.nii.gz'):
+            nifti_files.append(os.path.join(root, fname))
+
+
+rna_samples, image_paths = [], []
+for sample_id in rna_df.index:
+    matches = [p for p in nifti_files if os.path.basename(p) in (f"{sample_id}.nii.gz", f"{sample_id}.nii")]
+    if not matches:
+        continue
+    img_path = matches[0]
+    seg_key = 'seg' + sample_id.replace('-', '') + '.nii.gz'
+    if seg_key not in bbox_coords:
+        continue
+    rna_samples.append(rna_df.loc[sample_id])
+    image_paths.append(img_path)
+
+if not rna_samples:
+    raise ValueError(" no match！")
+rna_df_filtered = pd.DataFrame(rna_samples)
+print(f"[INFO] amtch {len(rna_samples)} for train/val")
+
+
+rna_train, rna_val, img_train_paths, img_val_paths = train_test_split(
+    rna_df_filtered, image_paths, test_size=0.2, random_state=42
+)
+
+def strip_nii_suffix(filename):
+    return re.sub(r'(\.nii(\.gz)?)$', '', filename)
+
+def sample_slices(total_slices, n=N_CHANNELS):
+    if total_slices < n:
+        idxs = list(range(total_slices)) + [total_slices//2]*(n-total_slices)
+        return idxs[:n]
+    else:
+        return np.linspace(0, total_slices-1, n, dtype=int)
+
+class RNACustomDataset(Dataset):
+    def __init__(self, rna_data, img_paths, bbox_path, img_size=IMG_SIZE, n_channels=N_CHANNELS):
+        self.rna = rna_data.reset_index(drop=True)
+        self.img_paths = img_paths
+        with open(bbox_path, 'r') as f:
+            self.bbox = json.load(f)
+        self.img_size = img_size
+        self.n_channels = n_channels
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        rna_vec = torch.tensor(self.rna.iloc[idx].values, dtype=torch.float)
+        path = self.img_paths[idx]
+        vol = nib.load(path).get_fdata()
+        fname = os.path.basename(path)
+        sample_id_core = strip_nii_suffix(fname)
+        seg_key = 'seg' + sample_id_core.replace('-', '') + '.nii.gz'
+        
+        bbox = self.bbox[seg_key]
+        x0, x1 = sorted((bbox['x_min'], bbox['x_max']))
+        y0, y1 = sorted((bbox['y_min'], bbox['y_max']))
+        z0, z1 = sorted((bbox['z_min'], bbox['z_max']))
+        roi = vol[x0:x1, y0:y1, z0:z1]
+        
+
+        slice_idxs = sample_slices(roi.shape[2], n=self.n_channels)
+        imgs = [roi[:, :, i] for i in slice_idxs]
+        imgs = np.stack(imgs, axis=0)  # (n_channels, H, W)
+        imgs = (imgs - imgs.min()) / (imgs.max() - imgs.min() + 1e-8)
+        imgs_resized = []
+        for i in range(self.n_channels):
+            img = Image.fromarray((imgs[i]*255).astype(np.uint8))
+            img = img.resize((self.img_size, self.img_size))
+            imgs_resized.append(np.array(img, dtype=np.float32) / 255.0)
+        imgs_resized = np.stack(imgs_resized, axis=0)  # (n_channels, H, W)
+        imgs_tensor = torch.tensor(imgs_resized, dtype=torch.float)  # (n_channels, H, W)
+        return rna_vec, imgs_tensor
+
+train_ds = RNACustomDataset(rna_train, img_train_paths, bbox_json_path)
+val_ds   = RNACustomDataset(rna_val,   img_val_paths,   bbox_json_path)
+train_loader = DataLoader(train_ds, batch_size=4, shuffle=True)
+val_loader   = DataLoader(val_ds, batch_size=4, shuffle=False)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+input_dim = rna_df_filtered.shape[1]
+model = CLIPModel(
+    RNAEncoder(input_dim=input_dim),
+    ResNetMultiChannel(n_channels=N_CHANNELS, embedding_dim=512)
+).to(device)
+
+criterion = ContrastiveLoss(temperature=0.5)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=10
+)
+class EarlyStopping:
+    def __init__(self, patience=20, min_delta=1e-4):
+        self.patience, self.min_delta = patience, min_delta
+        self.best, self.counter = np.inf, 0
+    def __call__(self, loss):
+        if loss < self.best - self.min_delta:
+            self.best, self.counter = loss, 0
+        else:
+            self.counter += 1
+        return self.counter >= self.patience
+early_stop = EarlyStopping()
+
+for epoch in range(1, 51):
+    model.train()
+    train_loss = 0.0
+    for rna_vec, imgs in train_loader:
+        print("imgs.shape:", imgs.shape)  # debug
+        rna_vec, imgs = rna_vec.to(device), imgs.to(device)
+        emb_r, emb_i  = model(rna_vec, imgs)
+        loss = criterion(emb_r, emb_i)
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        train_loss += loss.item()
+    train_loss /= len(train_loader)
+
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for rna_vec, imgs in val_loader:
+            rna_vec, imgs = rna_vec.to(device), imgs.to(device)
+            emb_r, emb_i  = model(rna_vec, imgs)
+            val_loss += criterion(emb_r, emb_i).item()
+    val_loss /= len(val_loader)
+
+    lr = optimizer.param_groups[0]['lr']
+    print(f"Epoch {epoch}: Train={train_loss:.4f} Val={val_loss:.4f} LR={lr:.6f}")
+
+    scheduler.step(val_loss)
+    if early_stop(val_loss):
+        print(" EarlyStopping triggered.")
+        break
+
+torch.save(model.state_dict(), "clip_model_vit_contrastive_pretrained.pth")
+print(" Model saved: clip_model_vit_contrastive_pretrained.pth")
