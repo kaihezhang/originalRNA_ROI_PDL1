@@ -1,0 +1,67 @@
+import os
+import json
+import torch
+import nibabel as nib
+import numpy as np
+import pandas as pd
+from PIL import Image
+from torch.utils.data import Dataset
+
+class RNACustomDataset(Dataset):
+    def __init__(self, rna_csv_path, image_filenames, image_directory, bbox_json_path, transform=None):
+      
+        self.rna_df = pd.read_csv(rna_csv_path, index_col=0)
+        self.sample_ids = list(self.rna_df.columns)
+        self.image_filenames = image_filenames
+        self.image_directory = image_directory
+        self.transform = transform
+
+       
+        with open(bbox_json_path, 'r') as f:
+            self.bbox_coords = json.load(f)
+
+     
+        self.valid_indices = []
+        for i, fname in enumerate(self.image_filenames):
+            sid = os.path.splitext(fname)[0]
+            img_path = os.path.join(self.image_directory, fname)
+            if sid in self.sample_ids and os.path.exists(img_path):
+                seg_key = f"seg{fname}"
+                if seg_key in self.bbox_coords:
+                    self.valid_indices.append(i)
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        true_idx = self.valid_indices[idx]
+        fname = self.image_filenames[true_idx]
+        sample_id = os.path.splitext(fname)[0]
+
+        
+        expr = self.rna_df[sample_id].values.astype(np.float32)
+        rna_sample = torch.from_numpy(expr)
+
+       
+        img_path = os.path.join(self.image_directory, fname)
+        nii = nib.load(img_path)
+        vol = nii.get_fdata()
+
+        seg_key = f"seg{fname}"
+        bbox = self.bbox_coords[seg_key]
+        x0, x1 = max(0, bbox['x_min']), min(vol.shape[0], bbox['x_max'])
+        y0, y1 = max(0, bbox['y_min']), min(vol.shape[1], bbox['y_max'])
+        z0, z1 = max(0, bbox['z_min']), min(vol.shape[2], bbox['z_max'])
+        roi = vol[x0:x1, y0:y1, z0:z1]
+
+        
+        mid = roi[:, :, roi.shape[2] // 2]
+        
+        rgb = (mid - mid.min()) / (mid.max() - mid.min() + 1e-5) * 255
+        rgb = np.stack([rgb]*3, axis=-1).astype(np.uint8)
+        img = Image.fromarray(rgb)
+
+        if self.transform:
+            img = self.transform(img)
+
+        return rna_sample, img
