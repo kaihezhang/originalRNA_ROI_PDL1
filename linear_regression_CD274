@@ -1,0 +1,77 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import statsmodels.api as sm  
+
+
+df = pd.read_csv(
+    r'C:\Users\95602\Desktop\ultrasound-contrastivemodels-klr-us-rna\TCIA\TCIA\combined_summary_filtered.csv',
+    index_col=0)
+
+
+df_T = df.T
+print(f"SHAPE: {df.shape}, AFTER: {df_T.shape}")
+
+scaler = StandardScaler()
+X = scaler.fit_transform(df_T.values)
+
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X)
+print(
+    f"FULL GENE PCA: PC1Explained varianc: {pca.explained_variance_ratio_[0]:.2%}, PC2Explained variance: {pca.explained_variance_ratio_[1]:.2%}")
+
+
+def univariate_linreg_pval_selection(X, y, alpha=0.01):
+    selected_indices = []
+    pvals = []
+    for i in range(X.shape[1]):
+        feature = X[:, i]
+        feature = sm.add_constant(feature) 
+        model = sm.OLS(y, feature)
+        results = model.fit()
+        pval = results.pvalues[1] 
+        if pval < alpha:
+            selected_indices.append(i)
+            pvals.append(pval)
+    print(f"p LESS THAN{alpha}: {len(selected_indices)}")
+    return X[:, selected_indices], selected_indices, pvals
+
+X_selected, selected_indices, pvals = univariate_linreg_pval_selection(X, y, alpha=0.01)
+
+
+pca_selected = PCA(n_components=2)
+X_pca_selected = pca_selected.fit_transform(X_selected)
+print(
+    f"Feature selection PCA: PC1Explained variance: {pca_selected.explained_variance_ratio_[0]:.2%}, PC2Explained variance: {pca_selected.explained_variance_ratio_[1]:.2%}")
+
+
+pc1 = X_pca[:, 0]
+pc2 = X_pca[:, 1]
+
+plt.figure(figsize=(10, 8))
+plt.scatter(pc1, pc2, c=y, cmap='viridis')
+plt.colorbar(label='CD274 Expression')
+plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+plt.title('RNA-seq Samples Projected onto PC1 and PC2 (All Features)')
+plt.tight_layout()
+plt.savefig('pc1_pc2_scatter_all_features.png', dpi=300)
+plt.show()
+
+
+pc1_selected = X_pca_selected[:, 0]
+pc2_selected = X_pca_selected[:, 1]
+
+plt.figure(figsize=(10, 8))
+plt.scatter(pc1_selected, pc2_selected, c=y, cmap='viridis')
+plt.colorbar(label='CD274 Expression')
+plt.xlabel(f'PC1 ({pca_selected.explained_variance_ratio_[0]:.2%} variance)')
+plt.ylabel(f'PC2 ({pca_selected.explained_variance_ratio_[1]:.2%} variance)')
+plt.title('RNA-seq Samples Projected onto PC1 and PC2 (Selected Features: p<0.01)')
+plt.tight_layout()
+plt.savefig('pc1_pc2_scatter_selected_features.png', dpi=300)
+plt.show()
+
+
